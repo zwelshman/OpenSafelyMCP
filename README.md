@@ -38,7 +38,7 @@ Add the following snippet to your MCP settings file (e.g., `mcpServers.json` or 
 {
   "mcpServers": {
     "OpenSafelyMCP": {
-      "type": "http",
+      "type": "sse",
       "url": "https://opensafelymcp.onrender.com/mcp/sse"
     }
   }
