@@ -48,7 +48,6 @@ tmp/
 
 # Large data files (if not tracked)
 *.json
-!cardiovascular_projects.json
 !requirements.txt
 !flow.json
 !use_cases.md
