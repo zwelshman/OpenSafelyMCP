@@ -4,3 +4,5 @@ langchain-astradb>=1.0.0
 astrapy>=2.3.2
 uvicorn
 gitpython
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0

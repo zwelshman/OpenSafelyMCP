@@ -1,6 +1,11 @@
 import os
 import sys
 import uvicorn
+import asyncio
+import aiohttp
+from bs4 import BeautifulSoup
+from typing import List, Dict, Optional
+from dataclasses import dataclass, asdict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -10,6 +15,20 @@ from mcp.server.transport_security import TransportSecuritySettings
 # Force line buffering so execution logs print instantly in cloud control panels
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
+
+# Data class for OpenSAFELY project details
+@dataclass
+class OpenSafelyProject:
+    project_id: str
+    title: str
+    url: str
+    organisation: str
+    project_type: str
+    date: str
+    tags: List[str]
+    description: str
+    full_content: str
+    study_lead: str
 
 # 1. Initialize FastMCP with transport security configured for cloud hosting
 mcp = FastMCP(
@@ -126,6 +145,265 @@ def get_any_template(script_name: str) -> str:
             
     return f"Template '{script_name}' not found."
 
+
+# OpenSAFELY Projects Scraper Tools
+@dataclass
+class ProjectListItem:
+    """Basic project info from the list page."""
+    url: str
+    title: str
+    organisation: str
+    project_type: str
+    date: str
+    tags: List[str]
+
+
+async def fetch_projects_list_page(session: aiohttp.ClientSession, page: int) -> List[ProjectListItem]:
+    """Fetch a single page of the projects list and return project info."""
+    if page == 1:
+        url = "https://www.opensafely.org/projects/"
+    else:
+        url = f"https://www.opensafely.org/projects/page/{page}/"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                return []
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            projects = []
+            
+            # Find all project list items (li elements containing project links)
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if href.startswith('https://www.opensafely.org/project/') and href.endswith('/'):
+                    # Get the parent li container
+                    container = link.find_parent('li')
+                    if container:
+                        text = container.get_text(strip=True)
+                        # Normalize whitespace for regex matching
+                        normalized_text = ' '.join(text.split())
+                        
+                        # Extract title from link
+                        title = link.get_text(strip=True)
+                        
+                        # Extract organisation
+                        organisation = ""
+                        project_type = ""
+                        import re
+                        
+                        # Pattern: "Research project run by University of Bristol."
+                        org_match = re.search(r'(Research project|Service evaluation project|Short data report project)\s+run by\s+([^.]+)\.', normalized_text)
+                        if org_match:
+                            project_type = org_match.group(1)
+                            organisation = org_match.group(2).strip()
+                        
+                        # Extract date
+                        date = ""
+                        date_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}', normalized_text)
+                        if date_match:
+                            date = date_match.group(0)
+                        
+                        # Extract tags
+                        tags = []
+                        if 'COVID-19' in normalized_text:
+                            tags.append('COVID-19')
+                        
+                        projects.append(ProjectListItem(
+                            url=href,
+                            title=title,
+                            organisation=organisation,
+                            project_type=project_type,
+                            date=date,
+                            tags=tags
+                        ))
+            
+            return projects
+            
+    except Exception as e:
+        print(f"Error fetching projects page {page}: {e}")
+        return []
+
+
+async def fetch_project_details(session: aiohttp.ClientSession, project_item: ProjectListItem) -> Optional[OpenSafelyProject]:
+    """Fetch detailed information for a single project from its detail page."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    
+    try:
+        async with session.get(project_item.url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                return None
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Extract project ID from URL
+            project_id = project_item.url.rstrip('/').split('/')[-1]
+            
+            # Extract title from meta tags or use list page title
+            title = project_item.title
+            og_title = soup.find('meta', property='og:title')
+            if og_title and og_title.get('content'):
+                title = og_title['content']
+            else:
+                h1 = soup.find('h1')
+                if h1:
+                    title = h1.get_text(strip=True)
+            
+            # Extract description from meta tags
+            description = ""
+            og_desc = soup.find('meta', property='og:description')
+            if og_desc and og_desc.get('content'):
+                description = og_desc['content']
+            else:
+                meta_desc = soup.find('meta', name='description')
+                if meta_desc and meta_desc.get('content'):
+                    description = meta_desc['content']
+            
+            # Extract full content from main/article
+            full_content = ""
+            main = soup.find('main')
+            if main:
+                full_content = main.get_text(strip=True)
+            else:
+                article = soup.find('article')
+                if article:
+                    full_content = article.get_text(strip=True)
+            
+            # Extract study lead(s) from full content
+            study_lead = ""
+            import re
+            # Pattern: "Study lead:Name" or "Study leads:Name1,Name2" followed by Organisation/Project type/Start date
+            # Handles both singular and plural forms
+            study_lead_match = re.search(r'Study leads?:\s*(.+?)(?:Organisation:|Project type:|Start date:|Topic area:|Date of approval:|$)', full_content)
+            if study_lead_match:
+                study_lead = study_lead_match.group(1).strip()
+            else:
+                # Fallback: try line-based approach
+                lines = full_content.split('\n')
+                for i, line in enumerate(lines):
+                    if 'Study lead:' in line or 'Study leads:' in line:
+                        for j in range(i+1, min(i+5, len(lines))):
+                            if lines[j].strip():
+                                study_lead = lines[j].strip()
+                                break
+                        break
+            
+            return OpenSafelyProject(
+                project_id=project_id,
+                title=title,
+                url=project_item.url,
+                organisation=project_item.organisation,
+                project_type=project_item.project_type,
+                date=project_item.date,
+                tags=project_item.tags,
+                description=description,
+                full_content=full_content[:10000],  # Limit content size
+                study_lead=study_lead
+            )
+            
+    except Exception as e:
+        print(f"Error fetching project {project_item.url}: {e}")
+        return None
+
+
+@mcp.tool()
+async def scrape_opensafely_projects(
+    max_pages: int = 8,
+    delay_between_requests: float = 1.0
+) -> str:
+    """
+    Scrape all OpenSAFELY projects from https://www.opensafely.org/projects/
+    
+    This extracts project details from all paginated pages (1-8 by default).
+    Each project includes: ID, title, URL, organisation, type, date, tags, description, and full content.
+    
+    Args:
+        max_pages: Maximum number of pages to scrape (default 8, which is the last page)
+        delay_between_requests: Delay in seconds between requests to be respectful (default 1.0)
+    
+    Returns:
+        JSON string with list of all projects
+    """
+    import json
+    
+    all_projects = []
+    all_project_urls = set()
+    
+    connector = aiohttp.TCPConnector(limit=5)
+    timeout = aiohttp.ClientTimeout(total=60)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # First, collect all project URLs from all pages
+        for page in range(1, max_pages + 1):
+            print(f"Fetching projects list page {page}...")
+            urls = await fetch_projects_list_page(session, page)
+            new_urls = [u for u in urls if u not in all_project_urls]
+            all_project_urls.update(new_urls)
+            print(f"  Found {len(new_urls)} new project URLs (total: {len(all_project_urls)})")
+            
+            if page < max_pages:
+                await asyncio.sleep(delay_between_requests)
+        
+        # Now fetch details for each project
+        print(f"Fetching details for {len(all_project_urls)} projects...")
+        for i, url in enumerate(sorted(all_project_urls)):
+            print(f"  [{i+1}/{len(all_project_urls)}] {url}")
+            project = await fetch_project_details(session, url)
+            if project:
+                all_projects.append(project)
+            await asyncio.sleep(delay_between_requests)
+    
+    # Convert to JSON-serializable format
+    projects_data = []
+    for project in all_projects:
+        projects_data.append(asdict(project))
+    
+    return json.dumps({
+        "total_projects": len(projects_data),
+        "pages_scraped": max_pages,
+        "projects": projects_data
+    }, indent=2)
+
+
+@mcp.tool()
+async def get_opensafely_project_details(project_url: str) -> str:
+    """
+    Get detailed information for a specific OpenSAFELY project.
+    
+    Args:
+        project_url: The project URL (e.g., https://www.opensafely.org/project/pos-2026-3019/)
+    
+    Returns:
+        JSON string with project details
+    """
+    import json
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            project = await fetch_project_details(session, project_url)
+            if project:
+                return json.dumps(asdict(project), indent=2)
+            else:
+                return json.dumps({"error": "Failed to fetch project details"})
+                
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # 4. Create standard FastAPI application
