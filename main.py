@@ -29,6 +29,18 @@ class OpenSafelyProject:
     description: str
     full_content: str
     study_lead: str
+    researchers: List[str]
+    workspaces: List[Dict[str, str]]  # List of workspace info: name, github_repo, branch, created_at, workspace_url
+
+
+@dataclass
+class WorkspaceInfo:
+    """Workspace information from jobs.opensafely.org"""
+    name: str
+    github_repo: str
+    branch: str
+    created_at: str
+    workspace_url: str
 
 # 1. Initialize FastMCP with transport security configured for cloud hosting
 mcp = FastMCP(
@@ -42,7 +54,21 @@ mcp = FastMCP(
 # 2. Register Core MCP RAG Tool
 @mcp.tool()
 def query_knowledge_base(question: str) -> str:
-    """ Search and retrieve answers from the Astra DB Vector Store RAG knowledge base using OpenRouter. """
+    """
+    Search and retrieve answers from the Astra DB Vector Store RAG knowledge base using OpenRouter.
+    
+    Use this tool for general questions about OpenSAFELY, ehrQL, study design, codelists, 
+    dummy data generation, and other OpenSAFELY documentation topics. The tool uses semantic 
+    search to find relevant documentation chunks and generates answers using an LLM.
+    
+    Args:
+        question: Natural language question about OpenSAFELY (e.g., "How do I define a dataset 
+                  in ehrQL?", "What are the required steps in project.yaml?", "How do I use 
+                  SNOMED codes in ehrQL?")
+    
+    Returns:
+        String answer from the RAG system based on the OpenSAFELY documentation knowledge base.
+    """
     try:
         from langflow.load import run_flow_from_json
         
@@ -107,7 +133,20 @@ def query_knowledge_base(question: str) -> str:
 
 @mcp.tool()
 def search_docs_by_filename(filename: str) -> str:
-    """ Searches the Astra DB knowledge base specifically for chunks belonging to a target filename or directory path (e.g., 'ethnicity.md' or 'how-to/ethnicity'). Use this when standard questions fail to pull the direct file contents. """
+    """
+    Search the Astra DB knowledge base specifically for chunks belonging to a target filename 
+    or directory path. Use this when standard questions fail to pull the direct file contents.
+    
+    This tool is optimized for retrieving the full text content of specific documentation files
+    from the OpenSAFELY ehrQL repository documentation.
+    
+    Args:
+        filename: The filename or path to search for (e.g., 'ethnicity.md', 'how-to/ethnicity', 
+                  'dataset-definition.md', 'codelists.md')
+    
+    Returns:
+        String containing the full documentation text from the specified file.
+    """
     # Crafting an exact-intent question forces the LLM inside Langflow to look past top-level structures
     target_question = f"Show me the full documentation text inside the file {filename}"
     print(f"INFO: Querying Vector Store for explicit file content: {filename}")
@@ -116,7 +155,23 @@ def search_docs_by_filename(filename: str) -> str:
 
 @mcp.tool()
 def get_doc_section_content(topic: str, section_header: str = None) -> str:
-    """ Fetches a comprehensive block of documentation text from Astra DB for a specific topic (e.g., 'ethnicity definition') and optionally refines it by an explicit section header. """
+    """
+    Fetch a comprehensive block of documentation text from Astra DB for a specific topic, 
+    optionally refined by an explicit section header.
+    
+    Use this tool when you need detailed documentation on a specific topic (e.g., 'ethnicity 
+    definition', 'dataset definition', 'codelist usage') and want to focus on a particular 
+    section of the documentation.
+    
+    Args:
+        topic: The topic to search for (e.g., 'ethnicity definition', 'dataset definition', 
+               'codelist usage', 'dummy data generation')
+        section_header: Optional specific section header to focus on (e.g., 'Creating 
+                        variables', 'Filtering patients', 'Importing codelists')
+    
+    Returns:
+        String containing detailed documentation text for the specified topic and section.
+    """
     refined_query = f"Provide all detailed documentation regarding {topic}"
     if section_header:
         refined_query += f" specifically focusing on the section: {section_header}"
@@ -156,6 +211,69 @@ class ProjectListItem:
     project_type: str
     date: str
     tags: List[str]
+
+
+async def fetch_workspace_details(session: aiohttp.ClientSession, jobs_url: str) -> List[Dict[str, str]]:
+    """Fetch workspace details from jobs.opensafely.org project page."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    
+    workspaces = []
+    
+    try:
+        async with session.get(jobs_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                return workspaces
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Find the Workspaces section
+            workspaces_header = soup.find('h2', string=lambda text: text and 'Workspaces' in text)
+            if not workspaces_header:
+                return workspaces
+            
+            # Find the ul list after the Workspaces header
+            workspaces_list = workspaces_header.find_next('ul', role='list')
+            if not workspaces_list:
+                return workspaces
+            
+            # Parse each workspace li
+            for li in workspaces_list.find_all('li', recursive=False):
+                workspace_info = {}
+                
+                # Get workspace name and URL
+                workspace_link = li.find('a', href=True)
+                if workspace_link:
+                    workspace_info['name'] = workspace_link.get_text(strip=True)
+                    workspace_info['workspace_url'] = 'https://jobs.opensafely.org' + workspace_link['href']
+                
+                # Get GitHub repository, branch, and created date
+                # These are in dd elements with sr-only dt labels
+                for dd in li.find_all('dd'):
+                    dt = dd.find_previous('dt')
+                    if dt:
+                        label = dt.get_text(strip=True)
+                        value = dd.get_text(strip=True)
+                        
+                        if 'GitHub repository' in label:
+                            workspace_info['github_repo'] = value
+                        elif 'Git branch' in label:
+                            workspace_info['branch'] = value
+                        elif 'Created at' in label:
+                            workspace_info['created_at'] = value
+                
+                if workspace_info:
+                    workspaces.append(workspace_info)
+            
+            return workspaces
+            
+    except Exception as e:
+        print(f"Error fetching workspace details from {jobs_url}: {e}")
+        return workspaces
 
 
 async def fetch_projects_list_page(session: aiohttp.ClientSession, page: int) -> List[ProjectListItem]:
@@ -267,7 +385,7 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
             if og_desc and og_desc.get('content'):
                 description = og_desc['content']
             else:
-                meta_desc = soup.find('meta', name='description')
+                meta_desc = soup.find('meta', attrs={'name': 'description'})
                 if meta_desc and meta_desc.get('content'):
                     description = meta_desc['content']
             
@@ -283,6 +401,7 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
             
             # Extract study lead(s) from full content
             study_lead = ""
+            researchers = []
             import re
             # Pattern: "Study lead:Name" or "Study leads:Name1,Name2" followed by Organisation/Project type/Start date
             # Handles both singular and plural forms
@@ -300,6 +419,34 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
                                 break
                         break
             
+            # Extract researchers from jobs.opensafely.org pages
+            # Look for the Researchers section with h2#researchers-title followed by ul/li
+            h2 = soup.find('h2', {'id': 'researchers-title'})
+            if h2:
+                grandparent = h2.parent.parent if h2.parent else None
+                if grandparent:
+                    for sibling in grandparent.find_next_siblings():
+                        ul = sibling.find('ul')
+                        if ul:
+                            for li in ul.find_all('li'):
+                                researcher_name = li.get_text(strip=True)
+                                if researcher_name:
+                                    researchers.append(researcher_name)
+                            break
+            
+            # Find the jobs.opensafely.org URL from the project page
+            jobs_url = None
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if 'jobs.opensafely.org' in href:
+                    jobs_url = href
+                    break
+            
+            # Fetch workspace information from jobs.opensafely.org
+            workspaces = []
+            if jobs_url:
+                workspaces = await fetch_workspace_details(session, jobs_url)
+            
             return OpenSafelyProject(
                 project_id=project_id,
                 title=title,
@@ -310,7 +457,9 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
                 tags=project_item.tags,
                 description=description,
                 full_content=full_content[:10000],  # Limit content size
-                study_lead=study_lead
+                study_lead=study_lead,
+                researchers=researchers,
+                workspaces=workspaces
             )
             
     except Exception as e:
@@ -327,14 +476,21 @@ async def scrape_opensafely_projects(
     Scrape all OpenSAFELY projects from https://www.opensafely.org/projects/
     
     This extracts project details from all paginated pages (1-8 by default).
-    Each project includes: ID, title, URL, organisation, type, date, tags, description, and full content.
+    Each project includes: ID, title, URL, organisation, type, date, tags, description, 
+    full content, study lead, researchers, and workspace information with GitHub repositories.
+    
+    Use this tool when you need a comprehensive list of all OpenSAFELY projects, or when
+    you want to discover projects by organisation, topic, or date range.
     
     Args:
-        max_pages: Maximum number of pages to scrape (default 8, which is the last page)
-        delay_between_requests: Delay in seconds between requests to be respectful (default 1.0)
+        max_pages: Maximum number of pages to scrape (default 8, which is the last page).
+                   Each page contains multiple projects.
+        delay_between_requests: Delay in seconds between requests to be respectful to the 
+                                server (default 1.0).
     
     Returns:
-        JSON string with list of all projects
+        JSON string with list of all projects including workspace information with GitHub 
+        repository details (name, github_repo, branch, created_at, workspace_url).
     """
     import json
     
@@ -380,15 +536,40 @@ async def scrape_opensafely_projects(
 @mcp.tool()
 async def get_opensafely_project_details(project_url: str) -> str:
     """
-    Get detailed information for a specific OpenSAFELY project.
+    Get detailed information for a specific OpenSAFELY project including workspace and 
+    GitHub repository information.
+    
+    This tool fetches comprehensive project details from the OpenSAFELY website and 
+    automatically discovers the associated jobs.opensafely.org page to extract workspace 
+    information including GitHub repository names, branches, and creation dates.
+    
+    Use this tool when you have a specific project URL and need:
+    - Project metadata (title, organisation, type, date, tags)
+    - Study lead and researchers
+    - Full project description
+    - **Workspace information with GitHub repositories** (name, github_repo, branch, 
+      created_at, workspace_url) - this is the key feature for finding code repositories
     
     Args:
-        project_url: The project URL (e.g., https://www.opensafely.org/project/pos-2026-3019/)
+        project_url: The project URL from opensafely.org 
+                     (e.g., 'https://www.opensafely.org/project/pos-2026-3018/' or 
+                      'https://www.opensafely.org/project/pos-2026-3008/')
     
     Returns:
-        JSON string with project details
+        JSON string with complete project details including workspaces array containing
+        GitHub repository information for each workspace.
     """
     import json
+    
+    # Create a minimal ProjectListItem from the URL
+    project_item = ProjectListItem(
+        url=project_url,
+        title="",
+        organisation="",
+        project_type="",
+        date="",
+        tags=[]
+    )
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -396,7 +577,7 @@ async def get_opensafely_project_details(project_url: str) -> str:
     
     try:
         async with aiohttp.ClientSession() as session:
-            project = await fetch_project_details(session, project_url)
+            project = await fetch_project_details(session, project_item)
             if project:
                 return json.dumps(asdict(project), indent=2)
             else:
