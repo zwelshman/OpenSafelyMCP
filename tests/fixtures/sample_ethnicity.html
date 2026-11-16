@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><title>Ethnicity definition - OpenSAFELY</title></head>
+<body>
+  <h1>Ethnicity definition</h1>
+  <p>This page describes how to define ethnicity variables in ehrQL.</p>
+  <h2>Creating variables</h2>
+  <p>Use the <code>codelist_from_csv</code> function to import codelists.</p>
+  <pre><code>from ehrql.codelist import codelist_from_csv
+ethnicity = codelist_from_csv("codelists/ethnicity.csv", column="code")</code></pre>
+  <p>Then reference the codelist in your dataset definition.</p>
+  <h2>Filtering patients</h2>
+  <p>Filter by ethnicity using the <code>where</code> method.</p>
+  <pre><code>dataset = dataset.where(ethnicity.is_not_null())</code></pre>
+</body>
+</html>
