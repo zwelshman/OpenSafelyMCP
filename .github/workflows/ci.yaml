@@ -1,0 +1,53 @@
+name: OpenSafelyMCP CI & Canary Evals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run daily at 06:00 UTC to catch upstream doc or vector store drift
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  offline-pr-checks:
+    name: Offline Contract & AST Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python & dependencies
+        run: uv sync --frozen --dev
+
+      - name: Run deterministic offline harness
+        run: uv run pytest -m "not canary" -v
+
+  live-canary-probes:
+    name: Live AstraDB & Scraper Canary Probes
+    runs-on: ubuntu-latest
+    # Run only on schedule, manual trigger, or direct push to main
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: offline-pr-checks
+    env:
+      ASTRA_DB_API_ENDPOINT: ${{ secrets.ASTRA_DB_API_ENDPOINT }}
+      ASTRA_DB_APPLICATION_TOKEN: ${{ secrets.ASTRA_DB_APPLICATION_TOKEN }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python & dependencies
+        run: uv sync --frozen --dev
+
+      - name: Run live retrieval & upstream doc canaries
+        run: uv run pytest -m "canary" -v --tb=short
