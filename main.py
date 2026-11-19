@@ -1,24 +1,43 @@
+#!/usr/bin/env python3
+"""
+OpenSafely MCP Server - Refactored for Best Practices
+
+This server provides Model Context Protocol (MCP) tools for accessing
+OpenSAFELY documentation and project information via a Langflow-powered
+RAG system and web scraping capabilities.
+"""
+
 import os
 import sys
-import uvicorn
+import json
 import asyncio
-import aiohttp
-from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
+
+# Force line buffering for immediate log output in cloud environments
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# Third-party imports
+import uvicorn
+import aiohttp
+from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-# Force line buffering so execution logs print instantly in cloud control panels
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+# Local imports (if any would go here)
 
-# Data class for OpenSAFELY project details
+
+# =============================================================================
+# DATA MODELS
+# =============================================================================
+
 @dataclass
 class OpenSafelyProject:
+    """Complete OpenSAFELY project information."""
     project_id: str
     title: str
     url: str
@@ -30,19 +49,175 @@ class OpenSafelyProject:
     full_content: str
     study_lead: str
     researchers: List[str]
-    workspaces: List[Dict[str, str]]  # List of workspace info: name, github_repo, branch, created_at, workspace_url
+    workspaces: List[Dict[str, str]]  # name, github_repo, branch, created_at, workspace_url
 
 
 @dataclass
 class WorkspaceInfo:
-    """Workspace information from jobs.opensafely.org"""
+    """Workspace information from jobs.opensafely.org."""
     name: str
     github_repo: str
     branch: str
     created_at: str
     workspace_url: str
 
-# 1. Initialize FastMCP with transport security configured for cloud hosting
+
+@dataclass
+class ProjectListItem:
+    """Basic project info from the list page."""
+    url: str
+    title: str
+    organisation: str
+    project_type: str
+    date: str
+    tags: List[str]
+
+
+@dataclass
+class DocChunk:
+    """A documentation chunk extracted from HTML/Markdown."""
+    heading: str
+    content: str
+    code_blocks: List[str]
+    metadata: Dict[str, str]
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def chunk_documentation(html_or_markdown: str, source_url: str = "") -> List[DocChunk]:
+    """
+    Chunk an OpenSAFELY documentation page into heading-based sections.
+    
+    Extracts headings (h1-h6 in HTML, # headings in Markdown) and groups the
+    content that follows each heading until the next heading of the same or
+    higher level. Code blocks are preserved separately for metadata tagging.
+    
+    Args:
+        html_or_markdown: Raw HTML or Markdown text of a documentation page.
+        source_url: Optional source URL for provenance metadata.
+        
+    Returns:
+        A list of DocChunk objects, one per heading section.
+    """
+    chunks: List[DocChunk] = []
+    
+    # Detect whether the input looks like HTML.
+    stripped = html_or_markdown.lstrip()
+    is_html = stripped.startswith("<") or "<html" in stripped[:200].lower()
+
+    if is_html:
+        soup = BeautifulSoup(html_or_markdown, "html.parser")
+        
+        # Remove script/style elements that would pollute text content.
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        
+        # Collect heading elements in document order.
+        headings = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+        
+        for idx, heading in enumerate(headings):
+            heading_text = heading.get_text(strip=True)
+            level = int(heading.name[1])
+            
+            # Gather content until the next heading of the same or higher level.
+            content_parts: List[str] = []
+            code_blocks: List[str] = []
+            
+            for sibling in heading.next_siblings:
+                if getattr(sibling, "name", None) in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                    sibling_level = int(sibling.name[1])
+                    if sibling_level <= level:
+                        break
+                if getattr(sibling, "get_text", None):
+                    text = sibling.get_text(strip=True)
+                    if text:
+                        content_parts.append(text)
+                # Capture code blocks within this section.
+                if getattr(sibling, "find_all", None):
+                    for code in sibling.find_all(["code", "pre"]):
+                        code_text = code.get_text(strip=True)
+                        if code_text and code_text not in code_blocks:
+                            code_blocks.append(code_text)
+            
+            content = "\n".join(content_parts)
+            chunks.append(
+                DocChunk(
+                    heading=heading_text,
+                    content=content,
+                    code_blocks=code_blocks,
+                    metadata={"source_url": source_url, "level": str(level)},
+                )
+            )
+    else:
+        # Markdown: split on ATX headings (# ...).
+        lines = html_or_markdown.splitlines()
+        current_heading = ""
+        current_level = 0
+        current_content: List[str] = []
+        current_code: List[str] = []
+        in_code_block = False
+        code_fence = ""
+        code_buffer: List[str] = []
+        
+        def flush() -> None:
+            nonlocal current_heading, current_content, current_code
+            if current_heading or current_content:
+                chunks.append(
+                    DocChunk(
+                        heading=current_heading,
+                        content="\n".join(current_content).strip(),
+                        code_blocks=current_code,
+                        metadata={"source_url": source_url, "level": str(current_level)},
+                    )
+                )
+            current_content = []
+            current_code = []
+        
+        for line in lines:
+            if line.startswith("```") or line.startswith("~~~"):
+                if not in_code_block:
+                    in_code_block = True
+                    code_fence = line[:3]
+                    code_buffer = []
+                else:
+                    in_code_block = False
+                    code_fence = ""
+                    block_text = "\n".join(code_buffer).strip()
+                    if block_text and block_text not in current_code:
+                        current_code.append(block_text)
+                continue
+            if in_code_block:
+                code_buffer.append(line)
+                continue
+            
+            heading_match = None
+            for marker in ("# ", "## ", "### ", "#### ", "##### ", "###### "):
+                if line.startswith(marker):
+                    heading_match = marker
+                    break
+            
+            if heading_match is not None:
+                level = len(heading_match) - 1
+                # Flush the previous heading's content before starting a new one.
+                if current_heading:
+                    flush()
+                current_heading = line[len(heading_match):].strip()
+                current_level = level
+            else:
+                current_content.append(line)
+        
+        flush()
+    
+    return chunks
+
+
+# =============================================================================
+# MCP SERVER INITIALIZATION
+# =============================================================================
+
+# Initialize FastMCP with transport security configured for cloud hosting
 mcp = FastMCP(
     "OpenSafely-Rag-Retrieve",
     transport_security=TransportSecuritySettings(
@@ -51,7 +226,11 @@ mcp = FastMCP(
     )
 )
 
-# 2. Register Core MCP RAG Tool
+
+# =============================================================================
+# MCP TOOLS - KNOWLEDGE BASE
+# =============================================================================
+
 @mcp.tool()
 def query_knowledge_base(question: str) -> str:
     """
@@ -72,29 +251,30 @@ def query_knowledge_base(question: str) -> str:
     try:
         from langflow.load import run_flow_from_json
         
-        # --- MONKEY PATCH TO FIX PROGRESS REPORTING ERROR ---
+        # Workaround for MCP Context progress reporting issue
         try:
             from mcp.server.fastmcp import Context
             orig_report_progress = Context.report_progress
             
-            # Redefine it to safely swallow unexpected kwargs like 'current'
             def safe_report_progress(self, *args, **kwargs):
+                # Handle the case where 'current' is passed instead of 'progress'
                 if 'current' in kwargs and 'progress' not in kwargs:
                     kwargs['progress'] = kwargs.pop('current')
                 try:
                     return orig_report_progress(self, *args, **kwargs)
                 except Exception:
-                    pass # Fail silently so it doesn't crash the execution
+                    # Fail silently to prevent execution crashes
+                    pass
             
             Context.report_progress = safe_report_progress
         except Exception as patch_err:
             print(f"WARN: Could not patch MCP Context: {patch_err}")
-        # ----------------------------------------------------
-
+        
+        # Check for required flow configuration
         if not os.path.exists("flow.json"):
             return "Error: flow.json layout configuration file is missing from the server root directory."
-
-        # Explicitly map Render system variables directly into the graph component configurations
+        
+        # Configure Langflow components with environment variables
         tweaks = {
             "ext:openrouter:OpenRouterComponent@official-Lbbp3": {
                 "api_key": os.environ.get("OPENROUTER_API_KEY", ""),
@@ -106,30 +286,28 @@ def query_knowledge_base(question: str) -> str:
                 "load_from_db": False 
             }
         }
-
+        
         print(f"INFO: Executing Langflow flow for question: {question}")
         result = run_flow_from_json(
             flow="flow.json",
             input_value=question,
             tweaks=tweaks
         )
-
-        # Safe extraction from the Langflow result list
+        
+        # Safely extract result from Langflow output
         if result and isinstance(result, list) and len(result) > 0:
             flow_output = result[0]
             if hasattr(flow_output, "outputs") and flow_output.outputs:
                 for output in flow_output.outputs:
                     if hasattr(output, "results") and "message" in output.results:
                         return output.results["message"].text
-                        
+        
         return "No response generated by the Langflow pipeline."
-
+    
     except Exception as e:
         print(f"ERROR: Runtime execution failure: {e}", file=sys.stderr)
         return f"Error executing Langflow graph: {str(e)}"
 
-
-# 3. Register Targeted Vector DB Tools (Fixes local file-system lookup issues)
 
 @mcp.tool()
 def search_docs_by_filename(filename: str) -> str:
@@ -147,7 +325,7 @@ def search_docs_by_filename(filename: str) -> str:
     Returns:
         String containing the full documentation text from the specified file.
     """
-    # Crafting an exact-intent question forces the LLM inside Langflow to look past top-level structures
+    # Craft an exact-intent question to bypass top-level structures in Langflow
     target_question = f"Show me the full documentation text inside the file {filename}"
     print(f"INFO: Querying Vector Store for explicit file content: {filename}")
     return query_knowledge_base(target_question)
@@ -175,43 +353,40 @@ def get_doc_section_content(topic: str, section_header: str = None) -> str:
     refined_query = f"Provide all detailed documentation regarding {topic}"
     if section_header:
         refined_query += f" specifically focusing on the section: {section_header}"
-        
+    
     print(f"INFO: Fetching deep topic content for: {refined_query}")
     return query_knowledge_base(refined_query)
 
-# 1. Dynamically locate the actual absolute templates directory path on Render
+
+# =============================================================================
+# MCP TOOLS - TEMPLATES
+# =============================================================================
+
+# Dynamically locate the actual absolute templates directory path
 TEMPLATES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "templates"))
 
 @mcp.resource("codebase://templates/{script_name}.py")
 def get_any_template(script_name: str) -> str:
     """Fetches a specific reference script from the codebase templates directory."""
     
-    # 2. Build the target path appending the script name cleanly
+    # Build the target path appending the script name cleanly
     target_path = os.path.abspath(os.path.join(TEMPLATES_DIR, f"{script_name}.py"))
     
-    # 3. Robust security check to prevent directory traversal (e.g., script_name = "../../../etc/passwd")
+    # Security check to prevent directory traversal attacks
     if not target_path.startswith(TEMPLATES_DIR + os.sep) and target_path != TEMPLATES_DIR:
         return "Access denied: Invalid template location."
-        
-    # 4. Read and return the file
+    
+    # Read and return the file if it exists
     if os.path.exists(target_path):
         with open(target_path, "r", encoding="utf-8") as f:
             return f.read()
-            
+    
     return f"Template '{script_name}' not found."
 
 
-# OpenSAFELY Projects Scraper Tools
-@dataclass
-class ProjectListItem:
-    """Basic project info from the list page."""
-    url: str
-    title: str
-    organisation: str
-    project_type: str
-    date: str
-    tags: List[str]
-
+# =============================================================================
+# MCP TOOLS - OPENSAFELY PROJECTS
+# =============================================================================
 
 async def fetch_workspace_details(session: aiohttp.ClientSession, jobs_url: str) -> List[Dict[str, str]]:
     """Fetch workspace details from jobs.opensafely.org project page."""
@@ -241,17 +416,17 @@ async def fetch_workspace_details(session: aiohttp.ClientSession, jobs_url: str)
             if not workspaces_list:
                 return workspaces
             
-            # Parse each workspace li
+            # Parse each workspace li element
             for li in workspaces_list.find_all('li', recursive=False):
                 workspace_info = {}
                 
-                # Get workspace name and URL
+                # Extract workspace name and URL
                 workspace_link = li.find('a', href=True)
                 if workspace_link:
                     workspace_info['name'] = workspace_link.get_text(strip=True)
                     workspace_info['workspace_url'] = 'https://jobs.opensafely.org' + workspace_link['href']
                 
-                # Get GitHub repository, branch, and created date
+                # Extract GitHub repository, branch, and created date
                 # These are in dd elements with sr-only dt labels
                 for dd in li.find_all('dd'):
                     dt = dd.find_previous('dt')
@@ -270,7 +445,7 @@ async def fetch_workspace_details(session: aiohttp.ClientSession, jobs_url: str)
                     workspaces.append(workspace_info)
             
             return workspaces
-            
+    
     except Exception as e:
         print(f"Error fetching workspace details from {jobs_url}: {e}")
         return workspaces
@@ -312,7 +487,7 @@ async def fetch_projects_list_page(session: aiohttp.ClientSession, page: int) ->
                         # Extract title from link
                         title = link.get_text(strip=True)
                         
-                        # Extract organisation
+                        # Extract organisation and project type
                         organisation = ""
                         project_type = ""
                         import re
@@ -344,7 +519,7 @@ async def fetch_projects_list_page(session: aiohttp.ClientSession, page: int) ->
                         ))
             
             return projects
-            
+    
     except Exception as e:
         print(f"Error fetching projects page {page}: {e}")
         return []
@@ -461,7 +636,7 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
                 researchers=researchers,
                 workspaces=workspaces
             )
-            
+    
     except Exception as e:
         print(f"Error fetching project {project_item.url}: {e}")
         return None
@@ -492,11 +667,10 @@ async def scrape_opensafely_projects(
         JSON string with list of all projects including workspace information with GitHub 
         repository details (name, github_repo, branch, created_at, workspace_url).
     """
-    import json
-    
     all_projects = []
     all_project_urls = set()
     
+    # Configure HTTP client with connection limits and timeout
     connector = aiohttp.TCPConnector(limit=5)
     timeout = aiohttp.ClientTimeout(total=60)
     
@@ -559,8 +733,6 @@ async def get_opensafely_project_details(project_url: str) -> str:
         JSON string with complete project details including workspaces array containing
         GitHub repository information for each workspace.
     """
-    import json
-    
     # Create a minimal ProjectListItem from the URL
     project_item = ProjectListItem(
         url=project_url,
@@ -582,18 +754,22 @@ async def get_opensafely_project_details(project_url: str) -> str:
                 return json.dumps(asdict(project), indent=2)
             else:
                 return json.dumps({"error": "Failed to fetch project details"})
-                
+    
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
-# 4. Create standard FastAPI application
+# =============================================================================
+# FASTAPI APPLICATION SETUP
+# =============================================================================
+
+# Create standard FastAPI application
 app = FastAPI(
     title="OpenSafely Rag MCP Server",
     description="Model Context Protocol (MCP) server delivering Astra DB RAG capabilities via Langflow."
 )
 
-# 5. Attach production middleware (Proxy headers for SSL/Host resolution & CORS)
+# Attach production middleware (Proxy headers for SSL/Host resolution & CORS)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.add_middleware(
     CORSMiddleware,
@@ -603,17 +779,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 6. Platform health check endpoint
+# Platform health check endpoint
 @app.get("/")
 async def health_check():
     return {
         "status": "healthy",
         "service": "OpenSafely-Rag-Retrieve-MCP",
-        "sse_endpoint": "/mcp/sse"
+        "mcp_endpoint": "/mcp"
     }
 
-# 7. Mount the FastMCP SSE application under /mcp namespace
-app.mount("/mcp", mcp.sse_app())
+# Mount the FastMCP StreamableHTTP application under /mcp namespace
+app.mount("/mcp", mcp.streamable_http_app())
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+markers = [
+    "canary: live integration and retrieval probes against AstraDB and upstream OpenSAFELY docs",
+]

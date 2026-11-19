@@ -37,7 +37,7 @@ Your AI assistant will automatically discover and utilize the following targeted
 
 ## ⚙️ Deployment & Integration
 
-*   **Hosted MCP Server (SSE Endpoint):** `https://opensafelymcp.onrender.com/mcp/sse`
+*   **Hosted MCP Server (StreamableHTTP Endpoint):** `https://opensafelymcp.onrender.com/mcp`
 
 ### VS Code / Cursor Configuration
 Add the following snippet to your MCP settings file (e.g., `mcpServers.json` or through your IDE settings panel) to connect your assistant:
@@ -46,8 +46,8 @@ Add the following snippet to your MCP settings file (e.g., `mcpServers.json` or 
 {
   "mcpServers": {
     "OpenSafelyMCP": {
-      "type": "sse",
-      "url": "https://opensafelymcp.onrender.com/mcp/sse"
+      "type": "streamable_http",
+      "url": "https://opensafelymcp.onrender.com/mcp"
     }
   }
 }
