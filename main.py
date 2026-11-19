@@ -24,6 +24,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # Line buffering so logs print instantly in cloud control panels
 sys.stdout.reconfigure(line_buffering=True)
@@ -66,6 +67,11 @@ Context.report_progress = _safe_report_progress
 # Server registration
 # =============================================================================
 
+# Explicit transport security: the SDK auto-enables DNS rebinding protection
+# with localhost-only allowed_hosts when transport_security is None AND the
+# default host is 127.0.0.1 — which 421s production Host headers (Render's
+# opensafelymcp.onrender.com) and rejected remote clients.
+# Configured explicitly here instead: protection on, hosts/origins from env.
 mcp: FastMCP = FastMCP(
     "OpenSafely-Rag-Retrieve",
     instructions=(
@@ -74,6 +80,14 @@ mcp: FastMCP = FastMCP(
         "search_docs_by_filename when you know the target document filename, "
         "get_doc_section_content for topic+section focused retrieval, and the "
         "scraper tools for live project/GitHub workspace discovery."
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=(
+            os.environ.get("MCP_ENABLE_DNS_REBINDING_PROTECTION", "true").lower()
+            not in ("false", "0", "no", "off")
+        ),
+        allowed_hosts=os.environ.get("MCP_ALLOWED_HOSTS", "opensafelymcp.onrender.com").split(","),
+        allowed_origins=os.environ.get("MCP_ALLOWED_ORIGINS", "").split(","),
     ),
 )
 
@@ -763,6 +777,8 @@ async def health_check(request: Request) -> Response:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     host = os.environ.get("HOST", "0.0.0.0")
+    # Set before run() — settings are consumed when the server binds, and
+    # run_streamable_http_async reads host/port from mcp.settings at serve time.
     mcp.settings.host = host
     mcp.settings.port = port
     mcp.run(transport="streamable-http")
