@@ -46,8 +46,13 @@ Add the following snippet to your MCP settings file (e.g., `mcpServers.json` or 
 {
   "mcpServers": {
     "OpenSafelyMCP": {
+<<<<<<< HEAD
       "type": "streamable_http",
       "url": "https://opensafelymcp.onrender.com/mcp"
+=======
+      "type":"sse",
+      "url":"https://opensafelymcp.onrender.com/mcp/sse"
+>>>>>>> 53c91d0c6ce61b51f1b928d42e0d7e3144cc2ede
     }
   }
 }
