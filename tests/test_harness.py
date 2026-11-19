@@ -347,7 +347,14 @@ class TestMCPToolContracts:
                 assert param in properties, (
                     f"Tool '{tool_name}' missing parameter '{param}'"
                 )
-                assert "type" in properties[param], (
+                param_schema = properties[param]
+                # Accept {"type": ...} or modern Optional[...] form
+                # {"anyOf": [{"type": ...}, {"type": "null"}]}
+                has_type = "type" in param_schema or (
+                    isinstance(param_schema.get("anyOf"), list)
+                    and any("type" in sub for sub in param_schema["anyOf"])
+                )
+                assert has_type, (
                     f"Tool '{tool_name}' param '{param}' has no type"
                 )
 

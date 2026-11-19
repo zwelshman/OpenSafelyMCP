@@ -1,43 +1,113 @@
 #!/usr/bin/env python3
-"""
-OpenSafely MCP Server - Refactored for Best Practices
+"""OpenSafely MCP server.
 
-This server provides Model Context Protocol (MCP) tools for accessing
-OpenSAFELY documentation and project information via a Langflow-powered
-RAG system and web scraping capabilities.
+Remote streamable-HTTP MCP server exposing OpenSAFELY documentation RAG
+(Langflow/Astra DB) plus live project scraping from opensafely.org.
+
+Transport: streamable HTTP at /mcp (default PORT 10000).
+Health check: GET /health — separate from the MCP endpoint.
 """
 
-import os
-import sys
-import json
+from __future__ import annotations
+
 import asyncio
-from typing import List, Dict, Optional
-from dataclasses import dataclass, asdict
+import json
+import os
+import re
+import sys
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
-# Force line buffering for immediate log output in cloud environments
+import aiohttp
+from bs4 import BeautifulSoup
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from mcp.server.fastmcp import Context, FastMCP
+
+# Line buffering so logs print instantly in cloud control panels
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# Third-party imports
-import uvicorn
-import aiohttp
-from bs4 import BeautifulSoup
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 
-# Local imports (if any would go here)
+# =============================================================================
+# Configuration (env-driven; nothing hardcoded)
+# =============================================================================
+
+API_TIMEOUT: float = float(os.environ.get("OPENSAFELY_TIMEOUT", "30"))
+MAX_PAGES_DEFAULT: int = int(os.environ.get("OPENSAFELY_MAX_PAGES", "8"))
+REQUEST_DELAY: float = float(os.environ.get("OPENSAFELY_REQUEST_DELAY", "1.0"))
+CONTENT_LIMIT: int = int(os.environ.get("OPENSAFELY_CONTENT_LIMIT", "10000"))
+BASE_URL = "https://www.opensafely.org"
+JOBS_BASE_URL = "https://jobs.opensafely.org"
+TINY_HEADERS = {"User-Agent": "Mozilla/5.0 OpenSafelyMCP/1.0"}
 
 
 # =============================================================================
-# DATA MODELS
+# Patch Context.report_progress to tolerate unexpected kwargs ("current")
 # =============================================================================
+
+_orig_report_progress = Context.report_progress
+
+
+def _safe_report_progress(self: Context, *args: Any, **kwargs: Any) -> None:
+    if "current" in kwargs and "progress" not in kwargs:
+        kwargs["progress"] = kwargs.pop("current")
+    try:
+        _orig_report_progress(self, *args, **kwargs)
+    except Exception:
+        pass  # progress reporting must never crash tool execution
+
+
+Context.report_progress = _safe_report_progress
+
+
+# =============================================================================
+# Server registration
+# =============================================================================
+
+mcp: FastMCP = FastMCP(
+    "OpenSafely-Rag-Retrieve",
+    instructions=(
+        "Tools for OpenSAFELY ehrQL documentation and live project data. "
+        "Use query_knowledge_base for general questions about OpenSAFELY/ehrQL, "
+        "search_docs_by_filename when you know the target document filename, "
+        "get_doc_section_content for topic+section focused retrieval, and the "
+        "scraper tools for live project/GitHub workspace discovery."
+    ),
+)
+
+
+# =============================================================================
+# Tool schemas / dataclasses
+# =============================================================================
+
+@dataclass
+class DocChunk:
+    """A single documentation chunk extracted from an HTML/Markdown page."""
+
+    heading: str
+    content: str
+    code_blocks: List[str]
+    metadata: Dict[str, str]
+
+
+@dataclass
+class ProjectListItem:
+    """Basic project info from the list page."""
+
+    url: str
+    title: str
+    organisation: str
+    project_type: str
+    date: str
+    tags: List[str]
+
 
 @dataclass
 class OpenSafelyProject:
     """Complete OpenSAFELY project information."""
+
     project_id: str
     title: str
     url: str
@@ -49,141 +119,139 @@ class OpenSafelyProject:
     full_content: str
     study_lead: str
     researchers: List[str]
-    workspaces: List[Dict[str, str]]  # name, github_repo, branch, created_at, workspace_url
-
-
-@dataclass
-class WorkspaceInfo:
-    """Workspace information from jobs.opensafely.org."""
-    name: str
-    github_repo: str
-    branch: str
-    created_at: str
-    workspace_url: str
-
-
-@dataclass
-class ProjectListItem:
-    """Basic project info from the list page."""
-    url: str
-    title: str
-    organisation: str
-    project_type: str
-    date: str
-    tags: List[str]
-
-
-@dataclass
-class DocChunk:
-    """A documentation chunk extracted from HTML/Markdown."""
-    heading: str
-    content: str
-    code_blocks: List[str]
-    metadata: Dict[str, str]
+    workspaces: List[Dict[str, str]]
 
 
 # =============================================================================
-# UTILITY FUNCTIONS
+# Langflow RAG / knowledge base helpers
 # =============================================================================
 
-def chunk_documentation(html_or_markdown: str, source_url: str = "") -> List[DocChunk]:
-    """
-    Chunk an OpenSAFELY documentation page into heading-based sections.
-    
+def _build_langflow_tweaks() -> Dict[str, Dict[str, Any]]:
+    """Map env vars into Langflow component config tweaks."""
+    return {
+        "ext:openrouter:OpenRouterComponent@official-Lbbp3": {
+            "api_key": os.environ.get("OPENROUTER_API_KEY", ""),
+            "load_from_db": False,
+        },
+        "ext:datastax:AstraDBVectorStoreComponent@official-zF58p": {
+            "token": os.environ.get("ASTRA_DB_APPLICATION_TOKEN", ""),
+            "api_endpoint": os.environ.get("ASTRA_DB_API_ENDPOINT", ""),
+            "load_from_db": False,
+        },
+    }
+
+
+def _extract_langflow_message(result: Any) -> Optional[str]:
+    """Pull the first message text out of a Langflow run result, if present."""
+    if not result or not isinstance(result, list):
+        return None
+    for flow_output in result:
+        outputs = getattr(flow_output, "outputs", None)
+        for output in outputs or []:
+            results = getattr(output, "results", None)
+            if results and "message" in results:
+                message = results["message"]
+                text = getattr(message, "text", None)
+                if text:
+                    return text
+    return None
+
+
+# =============================================================================
+# Documentation chunker (used to build the Astra DB corpus offline)
+# =============================================================================
+
+def chunk_documentation(
+    html_or_markdown: str, source_url: str = ""
+) -> List[DocChunk]:
+    """Chunk an OpenSAFELY documentation page into heading-based sections.
+
     Extracts headings (h1-h6 in HTML, # headings in Markdown) and groups the
     content that follows each heading until the next heading of the same or
     higher level. Code blocks are preserved separately for metadata tagging.
-    
+
     Args:
         html_or_markdown: Raw HTML or Markdown text of a documentation page.
         source_url: Optional source URL for provenance metadata.
-        
+
     Returns:
         A list of DocChunk objects, one per heading section.
     """
     chunks: List[DocChunk] = []
-    
-    # Detect whether the input looks like HTML.
+
     stripped = html_or_markdown.lstrip()
     is_html = stripped.startswith("<") or "<html" in stripped[:200].lower()
 
     if is_html:
         soup = BeautifulSoup(html_or_markdown, "html.parser")
-        
-        # Remove script/style elements that would pollute text content.
+
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
-        
-        # Collect heading elements in document order.
+
         headings = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-        
-        for idx, heading in enumerate(headings):
+
+        for heading in headings:
             heading_text = heading.get_text(strip=True)
             level = int(heading.name[1])
-            
-            # Gather content until the next heading of the same or higher level.
+
             content_parts: List[str] = []
             code_blocks: List[str] = []
-            
+
             for sibling in heading.next_siblings:
                 if getattr(sibling, "name", None) in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-                    sibling_level = int(sibling.name[1])
-                    if sibling_level <= level:
+                    if int(sibling.name[1]) <= level:
                         break
                 if getattr(sibling, "get_text", None):
                     text = sibling.get_text(strip=True)
                     if text:
                         content_parts.append(text)
-                # Capture code blocks within this section.
                 if getattr(sibling, "find_all", None):
                     for code in sibling.find_all(["code", "pre"]):
                         code_text = code.get_text(strip=True)
                         if code_text and code_text not in code_blocks:
                             code_blocks.append(code_text)
-            
-            content = "\n".join(content_parts)
+
             chunks.append(
                 DocChunk(
                     heading=heading_text,
-                    content=content,
+                    content="\n".join(content_parts),
                     code_blocks=code_blocks,
                     metadata={"source_url": source_url, "level": str(level)},
                 )
             )
     else:
-        # Markdown: split on ATX headings (# ...).
         lines = html_or_markdown.splitlines()
         current_heading = ""
         current_level = 0
         current_content: List[str] = []
         current_code: List[str] = []
         in_code_block = False
-        code_fence = ""
         code_buffer: List[str] = []
-        
+
         def flush() -> None:
-            nonlocal current_heading, current_content, current_code
+            nonlocal current_content, current_code
             if current_heading or current_content:
                 chunks.append(
                     DocChunk(
                         heading=current_heading,
                         content="\n".join(current_content).strip(),
-                        code_blocks=current_code,
-                        metadata={"source_url": source_url, "level": str(current_level)},
+                        code_blocks=list(current_code),
+                        metadata={
+                            "source_url": source_url,
+                            "level": str(current_level),
+                        },
                     )
                 )
             current_content = []
             current_code = []
-        
+
         for line in lines:
             if line.startswith("```") or line.startswith("~~~"):
                 if not in_code_block:
                     in_code_block = True
-                    code_fence = line[:3]
                     code_buffer = []
                 else:
                     in_code_block = False
-                    code_fence = ""
                     block_text = "\n".join(code_buffer).strip()
                     if block_text and block_text not in current_code:
                         current_code.append(block_text)
@@ -191,437 +259,373 @@ def chunk_documentation(html_or_markdown: str, source_url: str = "") -> List[Doc
             if in_code_block:
                 code_buffer.append(line)
                 continue
-            
-            heading_match = None
-            for marker in ("# ", "## ", "### ", "#### ", "##### ", "###### "):
-                if line.startswith(marker):
-                    heading_match = marker
-                    break
-            
+
+            heading_match = next(
+                (m for m in ("# ", "## ", "### ", "#### ", "##### ", "###### ")
+                 if line.startswith(m)),
+                None,
+            )
+
             if heading_match is not None:
-                level = len(heading_match) - 1
-                # Flush the previous heading's content before starting a new one.
                 if current_heading:
                     flush()
                 current_heading = line[len(heading_match):].strip()
-                current_level = level
+                current_level = len(heading_match) - 1
             else:
                 current_content.append(line)
-        
+
         flush()
-    
+
     return chunks
 
 
 # =============================================================================
-# MCP SERVER INITIALIZATION
+# MCP tools — knowledge base (Langflow RAG)
 # =============================================================================
 
-# Initialize FastMCP with transport security configured for cloud hosting
-mcp = FastMCP(
-    "OpenSafely-Rag-Retrieve",
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-        allowed_hosts=["*"]
-    )
-)
-
-
-# =============================================================================
-# MCP TOOLS - KNOWLEDGE BASE
-# =============================================================================
-
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def query_knowledge_base(question: str) -> str:
-    """
-    Search and retrieve answers from the Astra DB Vector Store RAG knowledge base using OpenRouter.
-    
-    Use this tool for general questions about OpenSAFELY, ehrQL, study design, codelists, 
-    dummy data generation, and other OpenSAFELY documentation topics. The tool uses semantic 
-    search to find relevant documentation chunks and generates answers using an LLM.
-    
+    """Search the Astra DB RAG knowledge base for answers about OpenSAFELY/ehrQL.
+
+    Use for general questions about OpenSAFELY, ehrQL, study design, codelists,
+    dummy data generation, and other documentation topics. Semantic search finds
+    relevant documentation chunks; an LLM generates the answer.
+
     Args:
-        question: Natural language question about OpenSAFELY (e.g., "How do I define a dataset 
-                  in ehrQL?", "What are the required steps in project.yaml?", "How do I use 
-                  SNOMED codes in ehrQL?")
-    
+        question: Natural language question (e.g. "How do I define a dataset
+            in ehrQL?", "What are the required steps in project.yaml?").
+
     Returns:
-        String answer from the RAG system based on the OpenSAFELY documentation knowledge base.
+        Answer text from the RAG pipeline over OpenSAFELY documentation.
     """
     try:
         from langflow.load import run_flow_from_json
-        
-        # Workaround for MCP Context progress reporting issue
-        try:
-            from mcp.server.fastmcp import Context
-            orig_report_progress = Context.report_progress
-            
-            def safe_report_progress(self, *args, **kwargs):
-                # Handle the case where 'current' is passed instead of 'progress'
-                if 'current' in kwargs and 'progress' not in kwargs:
-                    kwargs['progress'] = kwargs.pop('current')
-                try:
-                    return orig_report_progress(self, *args, **kwargs)
-                except Exception:
-                    # Fail silently to prevent execution crashes
-                    pass
-            
-            Context.report_progress = safe_report_progress
-        except Exception as patch_err:
-            print(f"WARN: Could not patch MCP Context: {patch_err}")
-        
-        # Check for required flow configuration
+
         if not os.path.exists("flow.json"):
             return "Error: flow.json layout configuration file is missing from the server root directory."
-        
-        # Configure Langflow components with environment variables
-        tweaks = {
-            "ext:openrouter:OpenRouterComponent@official-Lbbp3": {
-                "api_key": os.environ.get("OPENROUTER_API_KEY", ""),
-                "load_from_db": False 
-            },
-            "ext:datastax:AstraDBVectorStoreComponent@official-zF58p": {
-                "token": os.environ.get("ASTRA_DB_APPLICATION_TOKEN", ""),
-                "api_endpoint": os.environ.get("ASTRA_DB_API_ENDPOINT", ""),
-                "load_from_db": False 
-            }
-        }
-        
+
         print(f"INFO: Executing Langflow flow for question: {question}")
         result = run_flow_from_json(
             flow="flow.json",
             input_value=question,
-            tweaks=tweaks
+            tweaks=_build_langflow_tweaks(),
         )
-        
-        # Safely extract result from Langflow output
-        if result and isinstance(result, list) and len(result) > 0:
-            flow_output = result[0]
-            if hasattr(flow_output, "outputs") and flow_output.outputs:
-                for output in flow_output.outputs:
-                    if hasattr(output, "results") and "message" in output.results:
-                        return output.results["message"].text
-        
+
+        message = _extract_langflow_message(result)
+        if message:
+            return message
         return "No response generated by the Langflow pipeline."
-    
-    except Exception as e:
-        print(f"ERROR: Runtime execution failure: {e}", file=sys.stderr)
-        return f"Error executing Langflow graph: {str(e)}"
+
+    except Exception as exc:  # noqa: BLE001 — tool boundary; string errors are MCP-visible
+        print(f"ERROR: Runtime execution failure: {exc}", file=sys.stderr)
+        return f"Error executing Langflow graph: {exc}"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def search_docs_by_filename(filename: str) -> str:
-    """
-    Search the Astra DB knowledge base specifically for chunks belonging to a target filename 
-    or directory path. Use this when standard questions fail to pull the direct file contents.
-    
-    This tool is optimized for retrieving the full text content of specific documentation files
-    from the OpenSAFELY ehrQL repository documentation.
-    
+    """Retrieve full documentation text for a specific file from the vector store.
+
+    Use when general queries fail to pull direct file contents. Craft question
+    targets a single filename or path in the ehrQL documentation corpus.
+
     Args:
-        filename: The filename or path to search for (e.g., 'ethnicity.md', 'how-to/ethnicity', 
-                  'dataset-definition.md', 'codelists.md')
-    
+        filename: Filename or path to retrieve (e.g. 'ethnicity.md',
+            'how-to/ethnicity', 'dataset-definition.md', 'codelists.md').
+
     Returns:
-        String containing the full documentation text from the specified file.
+        Full documentation text for the requested file.
     """
-    # Craft an exact-intent question to bypass top-level structures in Langflow
     target_question = f"Show me the full documentation text inside the file {filename}"
     print(f"INFO: Querying Vector Store for explicit file content: {filename}")
     return query_knowledge_base(target_question)
 
 
-@mcp.tool()
-def get_doc_section_content(topic: str, section_header: str = None) -> str:
-    """
-    Fetch a comprehensive block of documentation text from Astra DB for a specific topic, 
-    optionally refined by an explicit section header.
-    
-    Use this tool when you need detailed documentation on a specific topic (e.g., 'ethnicity 
-    definition', 'dataset definition', 'codelist usage') and want to focus on a particular 
-    section of the documentation.
-    
+@mcp.tool(annotations={"readOnlyHint": True})
+def get_doc_section_content(topic: str, section_header: Optional[str] = None) -> str:
+    """Fetch a block of documentation from Astra DB for a topic, optionally by section.
+
+    Use when you need detailed documentation on a specific topic and want to
+    focus on a particular section of it.
+
     Args:
-        topic: The topic to search for (e.g., 'ethnicity definition', 'dataset definition', 
-               'codelist usage', 'dummy data generation')
-        section_header: Optional specific section header to focus on (e.g., 'Creating 
-                        variables', 'Filtering patients', 'Importing codelists')
-    
+        topic: Topic to search (e.g. 'ethnicity definition', 'dataset
+            definition', 'codelist usage', 'dummy data generation').
+        section_header: Optional section header to focus on (e.g. 'Creating
+            variables', 'Filtering patients', 'Importing codelists').
+
     Returns:
-        String containing detailed documentation text for the specified topic and section.
+        Detailed documentation text for the topic and section.
     """
     refined_query = f"Provide all detailed documentation regarding {topic}"
     if section_header:
         refined_query += f" specifically focusing on the section: {section_header}"
-    
+
     print(f"INFO: Fetching deep topic content for: {refined_query}")
     return query_knowledge_base(refined_query)
 
 
 # =============================================================================
-# MCP TOOLS - TEMPLATES
+# Templates resource
 # =============================================================================
 
-# Dynamically locate the actual absolute templates directory path
 TEMPLATES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "templates"))
+
 
 @mcp.resource("codebase://templates/{script_name}.py")
 def get_any_template(script_name: str) -> str:
-    """Fetches a specific reference script from the codebase templates directory."""
-    
-    # Build the target path appending the script name cleanly
+    """Fetch a reference script from the codebase templates directory."""
     target_path = os.path.abspath(os.path.join(TEMPLATES_DIR, f"{script_name}.py"))
-    
-    # Security check to prevent directory traversal attacks
+
+    # Prevent directory traversal (e.g. script_name = "../../etc/passwd")
     if not target_path.startswith(TEMPLATES_DIR + os.sep) and target_path != TEMPLATES_DIR:
         return "Access denied: Invalid template location."
-    
-    # Read and return the file if it exists
+
     if os.path.exists(target_path):
         with open(target_path, "r", encoding="utf-8") as f:
             return f.read()
-    
+
     return f"Template '{script_name}' not found."
 
 
 # =============================================================================
-# MCP TOOLS - OPENSAFELY PROJECTS
+# Async scraping helpers (opensafely.org / jobs.opensafely.org)
 # =============================================================================
 
-async def fetch_workspace_details(session: aiohttp.ClientSession, jobs_url: str) -> List[Dict[str, str]]:
-    """Fetch workspace details from jobs.opensafely.org project page."""
+async def fetch_workspace_details(
+    session: aiohttp.ClientSession, jobs_url: str
+) -> List[Dict[str, str]]:
+    """Fetch workspace details from a jobs.opensafely.org project page."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
-    
-    workspaces = []
-    
+
+    workspaces: List[Dict[str, str]] = []
+
     try:
-        async with session.get(jobs_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        async with session.get(
+            jobs_url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+        ) as response:
             if response.status != 200:
                 return workspaces
-            
+
             html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find the Workspaces section
-            workspaces_header = soup.find('h2', string=lambda text: text and 'Workspaces' in text)
+            soup = BeautifulSoup(html, "html.parser")
+
+            workspaces_header = soup.find(
+                "h2", string=lambda text: text and "Workspaces" in text
+            )
             if not workspaces_header:
                 return workspaces
-            
-            # Find the ul list after the Workspaces header
-            workspaces_list = workspaces_header.find_next('ul', role='list')
+
+            workspaces_list = workspaces_header.find_next("ul", role="list")
             if not workspaces_list:
                 return workspaces
-            
-            # Parse each workspace li element
-            for li in workspaces_list.find_all('li', recursive=False):
-                workspace_info = {}
-                
-                # Extract workspace name and URL
-                workspace_link = li.find('a', href=True)
+
+            for li in workspaces_list.find_all("li", recursive=False):
+                workspace_info: Dict[str, str] = {}
+
+                workspace_link = li.find("a", href=True)
                 if workspace_link:
-                    workspace_info['name'] = workspace_link.get_text(strip=True)
-                    workspace_info['workspace_url'] = 'https://jobs.opensafely.org' + workspace_link['href']
-                
-                # Extract GitHub repository, branch, and created date
-                # These are in dd elements with sr-only dt labels
-                for dd in li.find_all('dd'):
-                    dt = dd.find_previous('dt')
+                    workspace_info["name"] = workspace_link.get_text(strip=True)
+                    workspace_info["workspace_url"] = (
+                        JOBS_BASE_URL + workspace_link["href"]
+                    )
+
+                # GitHub repo / branch / created date live in dd elements
+                # with sr-only dt labels
+                for dd in li.find_all("dd"):
+                    dt = dd.find_previous("dt")
                     if dt:
                         label = dt.get_text(strip=True)
                         value = dd.get_text(strip=True)
-                        
-                        if 'GitHub repository' in label:
-                            workspace_info['github_repo'] = value
-                        elif 'Git branch' in label:
-                            workspace_info['branch'] = value
-                        elif 'Created at' in label:
-                            workspace_info['created_at'] = value
-                
+
+                        if "GitHub repository" in label:
+                            workspace_info["github_repo"] = value
+                        elif "Git branch" in label:
+                            workspace_info["branch"] = value
+                        elif "Created at" in label:
+                            workspace_info["created_at"] = value
+
                 if workspace_info:
                     workspaces.append(workspace_info)
-            
+
             return workspaces
-    
-    except Exception as e:
-        print(f"Error fetching workspace details from {jobs_url}: {e}")
+
+    except Exception as exc:  # noqa: BLE001 — log-and-continue for scraper resilience
+        print(f"Error fetching workspace details from {jobs_url}: {exc}")
         return workspaces
 
 
-async def fetch_projects_list_page(session: aiohttp.ClientSession, page: int) -> List[ProjectListItem]:
+async def fetch_projects_list_page(
+    session: aiohttp.ClientSession, page: int
+) -> List[ProjectListItem]:
     """Fetch a single page of the projects list and return project info."""
-    if page == 1:
-        url = "https://www.opensafely.org/projects/"
-    else:
-        url = f"https://www.opensafely.org/projects/page/{page}/"
-    
+    url = f"{BASE_URL}/projects/" if page == 1 else f"{BASE_URL}/projects/page/{page}/"
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
-    
+
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+        ) as response:
             if response.status != 200:
                 return []
-            
+
             html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            projects = []
-            
-            # Find all project list items (li elements containing project links)
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if href.startswith('https://www.opensafely.org/project/') and href.endswith('/'):
-                    # Get the parent li container
-                    container = link.find_parent('li')
+            soup = BeautifulSoup(html, "html.parser")
+            projects: List[ProjectListItem] = []
+
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                if href.startswith(f"{BASE_URL}/project/") and href.endswith("/"):
+                    container = link.find_parent("li")
                     if container:
-                        text = container.get_text(strip=True)
-                        # Normalize whitespace for regex matching
-                        normalized_text = ' '.join(text.split())
-                        
-                        # Extract title from link
+                        normalized_text = " ".join(container.get_text(strip=True).split())
                         title = link.get_text(strip=True)
-                        
-                        # Extract organisation and project type
+
                         organisation = ""
                         project_type = ""
-                        import re
-                        
-                        # Pattern: "Research project run by University of Bristol."
-                        org_match = re.search(r'(Research project|Service evaluation project|Short data report project)\s+run by\s+([^.]+)\.', normalized_text)
+                        org_match = re.search(
+                            r"(Research project|Service evaluation project|Short data report project)"
+                            r"\s+run by\s+([^.]+)\.",
+                            normalized_text,
+                        )
                         if org_match:
                             project_type = org_match.group(1)
                             organisation = org_match.group(2).strip()
-                        
-                        # Extract date
+
                         date = ""
-                        date_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}', normalized_text)
+                        date_match = re.search(
+                            r"(January|February|March|April|May|June|July|August|"
+                            r"September|October|November|December)\s+\d{4}",
+                            normalized_text,
+                        )
                         if date_match:
                             date = date_match.group(0)
-                        
-                        # Extract tags
-                        tags = []
-                        if 'COVID-19' in normalized_text:
-                            tags.append('COVID-19')
-                        
-                        projects.append(ProjectListItem(
-                            url=href,
-                            title=title,
-                            organisation=organisation,
-                            project_type=project_type,
-                            date=date,
-                            tags=tags
-                        ))
-            
+
+                        tags = ["COVID-19"] if "COVID-19" in normalized_text else []
+
+                        projects.append(
+                            ProjectListItem(
+                                url=href,
+                                title=title,
+                                organisation=organisation,
+                                project_type=project_type,
+                                date=date,
+                                tags=tags,
+                            )
+                        )
+
             return projects
-    
-    except Exception as e:
-        print(f"Error fetching projects page {page}: {e}")
+
+    except Exception as exc:  # noqa: BLE001 — log-and-continue for scraper resilience
+        print(f"Error fetching projects page {page}: {exc}")
         return []
 
 
-async def fetch_project_details(session: aiohttp.ClientSession, project_item: ProjectListItem) -> Optional[OpenSafelyProject]:
+async def fetch_project_details(
+    session: aiohttp.ClientSession, project_item: ProjectListItem
+) -> Optional[OpenSafelyProject]:
     """Fetch detailed information for a single project from its detail page."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
-    
+
     try:
-        async with session.get(project_item.url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        async with session.get(
+            project_item.url, headers=headers, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+        ) as response:
             if response.status != 200:
                 return None
-            
+
             html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Extract project ID from URL
-            project_id = project_item.url.rstrip('/').split('/')[-1]
-            
-            # Extract title from meta tags or use list page title
-            title = project_item.title
-            og_title = soup.find('meta', property='og:title')
-            if og_title and og_title.get('content'):
-                title = og_title['content']
+            soup = BeautifulSoup(html, "html.parser")
+
+            project_id = project_item.url.rstrip("/").split("/")[-1]
+
+            # Title: prefer og:title meta tag, fall back to h1
+            title = project_item.title or project_id.title()
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                title = og_title["content"]
             else:
-                h1 = soup.find('h1')
+                h1 = soup.find("h1")
                 if h1:
                     title = h1.get_text(strip=True)
-            
-            # Extract description from meta tags
+
+            # Description: og:description or meta description
             description = ""
-            og_desc = soup.find('meta', property='og:description')
-            if og_desc and og_desc.get('content'):
-                description = og_desc['content']
+            og_desc = soup.find("meta", property="og:description")
+            if og_desc and og_desc.get("content"):
+                description = og_desc["content"]
             else:
-                meta_desc = soup.find('meta', attrs={'name': 'description'})
-                if meta_desc and meta_desc.get('content'):
-                    description = meta_desc['content']
-            
-            # Extract full content from main/article
+                meta_desc = soup.find("meta", attrs={"name": "description"})
+                if meta_desc and meta_desc.get("content"):
+                    description = meta_desc["content"]
+
+            # Full content: main or article element text
             full_content = ""
-            main = soup.find('main')
+            main = soup.find("main")
             if main:
                 full_content = main.get_text(strip=True)
             else:
-                article = soup.find('article')
+                article = soup.find("article")
                 if article:
                     full_content = article.get_text(strip=True)
-            
-            # Extract study lead(s) from full content
+
+            # Study lead: "Study lead(s): Name..." followed by other labels or end
             study_lead = ""
-            researchers = []
-            import re
-            # Pattern: "Study lead:Name" or "Study leads:Name1,Name2" followed by Organisation/Project type/Start date
-            # Handles both singular and plural forms
-            study_lead_match = re.search(r'Study leads?:\s*(.+?)(?:Organisation:|Project type:|Start date:|Topic area:|Date of approval:|$)', full_content)
-            if study_lead_match:
-                study_lead = study_lead_match.group(1).strip()
+            researchers: List[str] = []
+            lead_match = re.search(
+                r"Study leads?:\s*(.+?)"
+                r"(?:Organisation:|Project type:|Start date:|Topic area:|Date of approval:|$)",
+                full_content,
+            )
+            if lead_match:
+                study_lead = lead_match.group(1).strip()
             else:
-                # Fallback: try line-based approach
-                lines = full_content.split('\n')
+                lines = full_content.split("\n")
                 for i, line in enumerate(lines):
-                    if 'Study lead:' in line or 'Study leads:' in line:
-                        for j in range(i+1, min(i+5, len(lines))):
+                    if "Study lead:" in line or "Study leads:" in line:
+                        for j in range(i + 1, min(i + 5, len(lines))):
                             if lines[j].strip():
                                 study_lead = lines[j].strip()
                                 break
                         break
-            
-            # Extract researchers from jobs.opensafely.org pages
-            # Look for the Researchers section with h2#researchers-title followed by ul/li
-            h2 = soup.find('h2', {'id': 'researchers-title'})
+
+            # Researchers: h2#researchers-title section followed by ul/li
+            h2 = soup.find("h2", {"id": "researchers-title"})
             if h2:
                 grandparent = h2.parent.parent if h2.parent else None
                 if grandparent:
                     for sibling in grandparent.find_next_siblings():
-                        ul = sibling.find('ul')
+                        ul = sibling.find("ul")
                         if ul:
-                            for li in ul.find_all('li'):
-                                researcher_name = li.get_text(strip=True)
-                                if researcher_name:
-                                    researchers.append(researcher_name)
+                            for li in ul.find_all("li"):
+                                name = li.get_text(strip=True)
+                                if name:
+                                    researchers.append(name)
                             break
-            
-            # Find the jobs.opensafely.org URL from the project page
+
+            # Discover jobs.opensafely.org URL, then workspace info
             jobs_url = None
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if 'jobs.opensafely.org' in href:
-                    jobs_url = href
+            for link in soup.find_all("a", href=True):
+                if "jobs.opensafely.org" in link["href"]:
+                    jobs_url = link["href"]
                     break
-            
-            # Fetch workspace information from jobs.opensafely.org
-            workspaces = []
+
+            workspaces: List[Dict[str, str]] = []
             if jobs_url:
                 workspaces = await fetch_workspace_details(session, jobs_url)
-            
+
             return OpenSafelyProject(
                 project_id=project_id,
                 title=title,
@@ -631,171 +635,134 @@ async def fetch_project_details(session: aiohttp.ClientSession, project_item: Pr
                 date=project_item.date,
                 tags=project_item.tags,
                 description=description,
-                full_content=full_content[:10000],  # Limit content size
+                full_content=full_content[:CONTENT_LIMIT],
                 study_lead=study_lead,
                 researchers=researchers,
-                workspaces=workspaces
+                workspaces=workspaces,
             )
-    
-    except Exception as e:
-        print(f"Error fetching project {project_item.url}: {e}")
+
+    except Exception as exc:  # noqa: BLE001 — log-and-continue for scraper resilience
+        print(f"Error fetching project {project_item.url}: {exc}")
         return None
 
 
-@mcp.tool()
+# =============================================================================
+# MCP tools — project scraping
+# =============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True})
 async def scrape_opensafely_projects(
-    max_pages: int = 8,
-    delay_between_requests: float = 1.0
+    max_pages: int = MAX_PAGES_DEFAULT,
+    delay_between_requests: float = REQUEST_DELAY,
 ) -> str:
-    """
-    Scrape all OpenSAFELY projects from https://www.opensafely.org/projects/
-    
-    This extracts project details from all paginated pages (1-8 by default).
-    Each project includes: ID, title, URL, organisation, type, date, tags, description, 
-    full content, study lead, researchers, and workspace information with GitHub repositories.
-    
-    Use this tool when you need a comprehensive list of all OpenSAFELY projects, or when
-    you want to discover projects by organisation, topic, or date range.
-    
+    """Scrape all OpenSAFELY projects from https://www.opensafely.org/projects/.
+
+    Extracts project details from paginated pages (1-8 by default). Each
+    project includes ID, title, URL, organisation, type, date, tags,
+    description, full content, study lead, researchers, and workspace info
+    with GitHub repositories.
+
     Args:
-        max_pages: Maximum number of pages to scrape (default 8, which is the last page).
-                   Each page contains multiple projects.
-        delay_between_requests: Delay in seconds between requests to be respectful to the 
-                                server (default 1.0).
-    
+        max_pages: Max pages to scrape (default 8). Each page lists many projects.
+        delay_between_requests: Delay in seconds between requests (default 1.0),
+            to stay respectful of the server.
+
     Returns:
-        JSON string with list of all projects including workspace information with GitHub 
-        repository details (name, github_repo, branch, created_at, workspace_url).
+        JSON string containing project data including workspace GitHub repo details.
     """
-    all_projects = []
+    all_projects: List[OpenSafelyProject] = []
     all_project_urls = set()
-    
-    # Configure HTTP client with connection limits and timeout
+
     connector = aiohttp.TCPConnector(limit=5)
-    timeout = aiohttp.ClientTimeout(total=60)
-    
+    timeout = aiohttp.ClientTimeout(total=max(API_TIMEOUT, 60))
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # First, collect all project URLs from all pages
+        # Collect all project URLs from list pages first
         for page in range(1, max_pages + 1):
             print(f"Fetching projects list page {page}...")
             urls = await fetch_projects_list_page(session, page)
-            new_urls = [u for u in urls if u not in all_project_urls]
-            all_project_urls.update(new_urls)
-            print(f"  Found {len(new_urls)} new project URLs (total: {len(all_project_urls)})")
-            
+            new_urls = [u for u in urls if u.url not in all_project_urls]
+            all_project_urls.update(u.url for u in new_urls)
+
+            if new_urls:
+                print(f"  Found {len(new_urls)} new project URLs (total: {len(all_project_urls)})")
+
             if page < max_pages:
                 await asyncio.sleep(delay_between_requests)
-        
-        # Now fetch details for each project
+
+        # Fetch full details per project URL
         print(f"Fetching details for {len(all_project_urls)} projects...")
-        for i, url in enumerate(sorted(all_project_urls)):
-            print(f"  [{i+1}/{len(all_project_urls)}] {url}")
-            project = await fetch_project_details(session, url)
+        detail_items = [
+            ProjectListItem(url=u, title="", organisation="",
+                            project_type="", date="", tags=[])
+            for u in sorted(all_project_urls)
+        ]
+        for i, item in enumerate(detail_items):
+            print(f"  [{i + 1}/{len(detail_items)}] {item.url}")
+            project = await fetch_project_details(session, item)
             if project:
                 all_projects.append(project)
             await asyncio.sleep(delay_between_requests)
-    
-    # Convert to JSON-serializable format
-    projects_data = []
-    for project in all_projects:
-        projects_data.append(asdict(project))
-    
+
+    projects_data = [asdict(p) for p in all_projects]
+
     return json.dumps({
         "total_projects": len(projects_data),
         "pages_scraped": max_pages,
-        "projects": projects_data
+        "projects": projects_data,
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 async def get_opensafely_project_details(project_url: str) -> str:
-    """
-    Get detailed information for a specific OpenSAFELY project including workspace and 
-    GitHub repository information.
-    
-    This tool fetches comprehensive project details from the OpenSAFELY website and 
-    automatically discovers the associated jobs.opensafely.org page to extract workspace 
-    information including GitHub repository names, branches, and creation dates.
-    
-    Use this tool when you have a specific project URL and need:
-    - Project metadata (title, organisation, type, date, tags)
-    - Study lead and researchers
-    - Full project description
-    - **Workspace information with GitHub repositories** (name, github_repo, branch, 
-      created_at, workspace_url) - this is the key feature for finding code repositories
-    
+    """Get detailed info for a specific OpenSAFELY project, including workspaces with GitHub repos.
+
+    Discovers the associated jobs.opensafely.org page and extracts workspace
+    GitHub repository names, branches, and creation dates.
+
     Args:
-        project_url: The project URL from opensafely.org 
-                     (e.g., 'https://www.opensafely.org/project/pos-2026-3018/' or 
-                      'https://www.opensafely.org/project/pos-2026-3008/')
-    
+        project_url: Project URL (e.g. 'https://www.opensafely.org/project/pos-2026-3018/').
+
     Returns:
-        JSON string with complete project details including workspaces array containing
-        GitHub repository information for each workspace.
+        JSON string with complete project details including workspaces.
     """
-    # Create a minimal ProjectListItem from the URL
     project_item = ProjectListItem(
-        url=project_url,
-        title="",
-        organisation="",
-        project_type="",
-        date="",
-        tags=[]
+        url=project_url, title="", organisation="",
+        project_type="", date="", tags=[],
     )
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-    
+
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as session:
             project = await fetch_project_details(session, project_item)
             if project:
                 return json.dumps(asdict(project), indent=2)
-            else:
-                return json.dumps({"error": "Failed to fetch project details"})
-    
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+            return json.dumps({"error": "Failed to fetch project details"})
+
+    except Exception as exc:  # noqa: BLE001 — tool boundary; string errors are MCP-visible
+        return json.dumps({"error": str(exc)})
 
 
 # =============================================================================
-# FASTAPI APPLICATION SETUP
+# Health check (custom route, separate from the MCP path)
 # =============================================================================
 
-# Create standard FastAPI application
-app = FastAPI(
-    title="OpenSafely Rag MCP Server",
-    description="Model Context Protocol (MCP) server delivering Astra DB RAG capabilities via Langflow."
-)
-
-# Attach production middleware (Proxy headers for SSL/Host resolution & CORS)
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Platform health check endpoint
-@app.get("/")
-async def health_check():
-    return {
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> Response:
+    """Health check endpoint for hosting platforms (Render)."""
+    return JSONResponse({
         "status": "healthy",
         "service": "OpenSafely-Rag-Retrieve-MCP",
-        "mcp_endpoint": "/mcp"
-    }
-
-# Mount the FastMCP StreamableHTTP application under /mcp namespace
-app.mount("/mcp", mcp.streamable_http_app())
+        "mcp_endpoint": "/mcp",
+    })
 
 
 # =============================================================================
-# MAIN ENTRY POINT
+# Main entry point — streamable HTTP transport
 # =============================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, timeout_keep_alive=300)
+    host = os.environ.get("HOST", "0.0.0.0")
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.run(transport="streamable-http")
