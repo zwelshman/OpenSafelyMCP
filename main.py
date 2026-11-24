@@ -15,7 +15,9 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -43,6 +45,11 @@ BASE_URL = "https://www.opensafely.org"
 JOBS_BASE_URL = "https://jobs.opensafely.org"
 TINY_HEADERS = {"User-Agent": "Mozilla/5.0 OpenSafelyMCP/1.0"}
 
+# Cache configuration
+CACHE_DIR = Path(os.environ.get("OPENSAFELY_CACHE_DIR", "data"))
+CACHE_TTL_HOURS: int = int(os.environ.get("OPENSAFELY_CACHE_TTL_HOURS", "24"))
+CACHE_FILE = CACHE_DIR / "opensafely_projects_cache.json"
+
 
 # =============================================================================
 # Patch Context.report_progress to tolerate unexpected kwargs ("current")
@@ -61,6 +68,38 @@ def _safe_report_progress(self: Context, *args: Any, **kwargs: Any) -> None:
 
 
 Context.report_progress = _safe_report_progress
+
+
+# =============================================================================
+# Cache helper functions
+# =============================================================================
+
+def _is_cache_valid() -> bool:
+    """Check if cache file exists and is within TTL."""
+    if not CACHE_FILE.exists():
+        return False
+    
+    cache_age_hours = (time.time() - CACHE_FILE.stat().st_mtime) / 3600
+    return cache_age_hours < CACHE_TTL_HOURS
+
+
+def _load_cache() -> Optional[Dict[str, Any]]:
+    """Load cached project data if valid."""
+    if not _is_cache_valid():
+        return None
+    
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _save_cache(data: Dict[str, Any]) -> None:
+    """Save project data to cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
 
 
 # =============================================================================
@@ -668,6 +707,7 @@ async def fetch_project_details(
 async def scrape_opensafely_projects(
     max_pages: int = MAX_PAGES_DEFAULT,
     delay_between_requests: float = REQUEST_DELAY,
+    force_refresh: bool = False,
 ) -> str:
     """Scrape all OpenSAFELY projects from https://www.opensafely.org/projects/.
 
@@ -680,10 +720,18 @@ async def scrape_opensafely_projects(
         max_pages: Max pages to scrape (default 8). Each page lists many projects.
         delay_between_requests: Delay in seconds between requests (default 1.0),
             to stay respectful of the server.
+        force_refresh: If True, bypass cache and re-scrape (default False).
 
     Returns:
         JSON string containing project data including workspace GitHub repo details.
     """
+    # Check cache first unless force_refresh is True
+    if not force_refresh:
+        cached_data = _load_cache()
+        if cached_data:
+            print(f"Returning cached data ({cached_data.get('total_projects', 0)} projects)")
+            return json.dumps(cached_data, indent=2)
+
     all_projects: List[OpenSafelyProject] = []
     all_project_urls = set()
 
@@ -720,11 +768,16 @@ async def scrape_opensafely_projects(
 
     projects_data = [asdict(p) for p in all_projects]
 
-    return json.dumps({
+    result = {
         "total_projects": len(projects_data),
         "pages_scraped": max_pages,
         "projects": projects_data,
-    }, indent=2)
+    }
+
+    # Save to cache
+    _save_cache(result)
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
