@@ -5,6 +5,8 @@
 [![Issues](https://img.shields.io/github/issues/zwelshman/OpenSafelyMCP?style=flat-square&logo=issues&color=critical)](https://github.com/zwelshman/OpenSafelyMCP/issues)
 [![Repo Size](https://img.shields.io/github/repo-size/zwelshman/OpenSafelyMCP?style=flat-square&logo=codeforces&color=success)](https://github.com/zwelshman/OpenSafelyMCP)
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/zwelshman-opensafely-rag-1047kv?v=06131c6fea75add94134e0bfc1a82fc2)](https://m8ven.ai/mcp/zwelshman-opensafely-rag-1047kv?s=readme)
+
 ⚠️ **Disclaimer:** This project is independent and not affiliated with the official OpenSafely project.
 
 An open-source Model Context Protocol (MCP) server that provides access to OpenSAFELY documentation and project information. It allows you to seamlessly integrate OpenSAFELY's ehrQL documentation and project metadata directly into your AI assistant of choice (such as Cursor, VS Code, or Claude Desktop).
